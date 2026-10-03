@@ -26,4 +26,6 @@ curl -fsSL https://raw.githubusercontent.com/wanderfran/tampa-virtual/main/desin
 swiftc -O tampa.swift -o tampa-virtual
 ```
 
+Limitação: reage à luz CAINDO de repente. Com o quarto já totalmente escuro, fechar a tampa não é percebido (assim ele não apaga com alguém usando no escuro).
+
 Registro em `~/Library/Logs/tampa-virtual.log`. Testado em MacBook Pro 14" M1 Pro (MacBookPro18,3), macOS 26.5.

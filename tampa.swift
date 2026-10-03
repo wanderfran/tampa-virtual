@@ -13,9 +13,9 @@ func CGSConfigureDisplayEnabled(_ config: CGDisplayConfigRef?, _ display: CGDire
 
 // Calibração: lux é inteiro; tampa fechada marcou 0, aberta 14-58 (02/10/2026).
 let LUX_FECHADA = 0
-let SEGUNDOS_PRA_CONFIRMAR = 4.0   // o sensor demora a atualizar; evita disparar com mão na frente
-let SEGUNDOS_SEM_USO_PRA_DORMIR = 5.0 // proteção: no escuro, com alguém digitando, não dorme
-let INTERVALO = 1.0
+let SEGUNDOS_PRA_CONFIRMAR = 1.0   // pedido dele: o mais rápido possível (mão na frente da câmera por 1 s já conta)
+let SEGUNDOS_SEM_USO_PRA_DORMIR = 1.0 // proteção mínima: digitando no escuro não dorme
+let INTERVALO = 0.25
 
 func log(_ s: String) {
     let f = DateFormatter(); f.dateFormat = "dd/MM HH:mm:ss"
@@ -38,7 +38,8 @@ func registro(_ classe: String, _ chave: String) -> Any? {
     return nil
 }
 
-func lux() -> Int? { (registro("AppleSPUVD6286", "CurrentLux") as? NSNumber)?.intValue }
+// sensor desligado (repouso) devolve UInt64 máximo = -1: tratar como "sem leitura"
+func lux() -> Int? { (registro("AppleSPUVD6286", "CurrentLux") as? NSNumber).map { $0.intValue }.flatMap { $0 >= 0 ? $0 : nil } }
 func semUso() -> Double { ((registro("IOHIDSystem", "HIDIdleTime") as? NSNumber)?.doubleValue ?? 0) / 1e9 }
 
 func naTomada() -> Bool {
@@ -76,10 +77,15 @@ if CommandLine.arguments.dropFirst().first == "teste" {
 }
 
 var idInterna = interna()
-var apagada = false          // tela interna desligada por nós
-var escuroDesde: Date? = nil
-var ultimoRepouso = Date.distantPast
-let SEGUNDOS_ENTRE_TENTATIVAS = 15.0 // sem o sensor, o trackpad não desliga e um toque acorda o Mac
+var apagada = false            // tela interna desligada por nós
+var ultimoLux: Int? = nil
+var escuroDesde: Date? = nil   // só começa numa BORDA (luz caiu de >0 pra 0): quarto escuro parado não conta
+var tratada = false            // esta borda já virou ação
+var tentativas = 0             // repouso abortado por toque no trackpad: tenta de novo
+var tentouEm = Date.distantPast
+var ultimaVolta = Date()
+let MAX_TENTATIVAS = 3
+let SEGUNDOS_PRA_REPOUSO_ENTRAR = 8.0 // pmset sleepnow leva ~5 s até dormir de fato
 log("iniciado; interna=\(idInterna.map(String.init) ?? "?")")
 
 func religar(_ motivo: String) {
@@ -88,36 +94,44 @@ func religar(_ motivo: String) {
     log(motivo)
 }
 
+func podeDormir() -> Bool {
+    CGDisplayIsAsleep(CGMainDisplayID()) == 0 && semUso() >= SEGUNDOS_SEM_USO_PRA_DORMIR
+}
+
 while true {
+    let agora = Date()
+    // salto no relógio = o Mac dormiu de verdade; ao acordar não insiste (pode ser ele abrindo)
+    if agora.timeIntervalSince(ultimaVolta) > 3 { tentativas = 0 }
+    ultimaVolta = agora
+
     if let atual = interna() { idInterna = atual }
 
     if let l = lux() {
-        if l <= LUX_FECHADA { escuroDesde = escuroDesde ?? Date() }
-        else {
-            escuroDesde = nil
+        if l <= LUX_FECHADA {
+            if let u = ultimoLux, u > LUX_FECHADA { escuroDesde = agora; tratada = false }
+        } else {
+            escuroDesde = nil; tratada = false; tentativas = 0
             if apagada { religar("tampa aberta: tela interna ligada") }
         }
+        ultimoLux = l
     }
 
-    let fechada = escuroDesde.map { Date().timeIntervalSince($0) >= SEGUNDOS_PRA_CONFIRMAR } ?? false
+    let fechou = !tratada && (escuroDesde.map { agora.timeIntervalSince($0) >= SEGUNDOS_PRA_CONFIRMAR } ?? false)
 
-    if fechada {
+    if fechou {
         if temExterna() && naTomada() {
-            if !apagada, let id = idInterna, ligarInterna(id, false) { apagada = true; log("tampa fechada: tela interna apagada") }
-        } else {
-            if apagada { religar("tampa fechada sem monitor/tomada: tela interna ligada") }
-            // tela apagada = DarkWake (Power Nap): o próprio macOS volta a dormir
-            if CGDisplayIsAsleep(CGMainDisplayID()) == 0 && semUso() >= SEGUNDOS_SEM_USO_PRA_DORMIR && Date().timeIntervalSince(ultimoRepouso) >= SEGUNDOS_ENTRE_TENTATIVAS {
-                log("tampa fechada: repouso")
-                ultimoRepouso = Date()
-                dormir()
-                escuroDesde = nil // ao acordar, exige escuro de novo antes de voltar a dormir
-            }
+            if let id = idInterna, ligarInterna(id, false) { apagada = true; tratada = true; log("tampa fechada: tela interna apagada") }
+        } else if podeDormir() {
+            log("tampa fechada: repouso"); tratada = true; tentativas = 1; tentouEm = agora; dormir()
         }
+    } else if tentativas > 0 && tentativas < MAX_TENTATIVAS && escuroDesde != nil
+                && agora.timeIntervalSince(tentouEm) >= SEGUNDOS_PRA_REPOUSO_ENTRAR && podeDormir() {
+        tentativas += 1; tentouEm = agora
+        log("repouso abortado (toque no trackpad?): tentativa \(tentativas)"); dormir()
     }
 
     // nunca deixar o Mac sem tela
-    if apagada && !temExterna() { religar("sem monitor externo: tela interna ligada") }
+    if apagada && !(temExterna() && naTomada()) { religar("sem monitor ou sem tomada: tela interna ligada"); tratada = false }
 
     Thread.sleep(forTimeInterval: INTERVALO)
 }
