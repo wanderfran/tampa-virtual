@@ -106,7 +106,8 @@ while true {
             if !apagada, let id = idInterna, ligarInterna(id, false) { apagada = true; log("tampa fechada: tela interna apagada") }
         } else {
             if apagada { religar("tampa fechada sem monitor/tomada: tela interna ligada") }
-            if semUso() >= SEGUNDOS_SEM_USO_PRA_DORMIR && Date().timeIntervalSince(ultimoRepouso) >= SEGUNDOS_ENTRE_TENTATIVAS {
+            // tela apagada = DarkWake (Power Nap): o próprio macOS volta a dormir
+            if CGDisplayIsAsleep(CGMainDisplayID()) == 0 && semUso() >= SEGUNDOS_SEM_USO_PRA_DORMIR && Date().timeIntervalSince(ultimoRepouso) >= SEGUNDOS_ENTRE_TENTATIVAS {
                 log("tampa fechada: repouso")
                 ultimoRepouso = Date()
                 dormir()
