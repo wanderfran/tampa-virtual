@@ -2,7 +2,7 @@
 
 Para MacBook com o sensor da tampa quebrado (lid angle sensor): fechar a tampa não faz nada.
 
-Usa o sensor de luz ambiente, que fica escuro com a tampa fechada, para imitar a tampa:
+Usa o trackpad para imitar a tampa: fechada, a tela deitada sobre ele aparece como um único contato gigante (~67 x 42 mm) no centro. Mão espalmada dá vários contatos menores e não dispara. Funciona com luz ou no escuro.
 
 - fechou, com monitor externo e na tomada: apaga a tela interna e segue nos monitores
 - fechou, sem monitor ou na bateria: repouso
@@ -26,6 +26,6 @@ curl -fsSL https://raw.githubusercontent.com/wanderfran/tampa-virtual/main/desin
 swiftc -O tampa.swift -o tampa-virtual
 ```
 
-Limitação: reage à luz CAINDO de repente. Com o quarto já totalmente escuro, fechar a tampa não é percebido (assim ele não apaga com alguém usando no escuro).
+Limitação: com o Mac em repouso, abrir a tampa não acorda; aperte uma tecla ou o Touch ID.
 
 Registro em `~/Library/Logs/tampa-virtual.log`. Testado em MacBook Pro 14" M1 Pro (MacBookPro18,3), macOS 26.5.

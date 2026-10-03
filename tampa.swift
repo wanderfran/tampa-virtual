@@ -1,5 +1,7 @@
 // tampa-virtual: o sensor da tampa deste Mac quebrou (AppleClamshellState fica em No).
-// Usa o sensor de luz ambiente (CurrentLux = 0 com a tampa fechada) pra imitar a tampa:
+// O trackpad imita a tampa: fechada, a tela deitada vira UM contato gigante (~67x42 mm) no centro;
+// mão espalmada dá 9-11 contatos de no máximo ~48x30 mm (medido 02/10/2026). Funciona com luz ou no escuro.
+// (O sensor de luz foi tentado e removido: no escuro oscila 0/1 e fazia o Mac dormir com gente usando.)
 //   fechou + monitor externo na tomada -> apaga só a tela interna (clamshell)
 //   fechou sem monitor ou na bateria   -> repouso
 //   abriu                              -> religa a tela interna
@@ -11,10 +13,9 @@ import IOKit.ps
 @_silgen_name("CGSConfigureDisplayEnabled")
 func CGSConfigureDisplayEnabled(_ config: CGDisplayConfigRef?, _ display: CGDirectDisplayID, _ enabled: Bool) -> CGError
 
-// Calibração: lux é inteiro; tampa fechada marcou 0, aberta 14-58 (02/10/2026).
-let LUX_FECHADA = 0
-let SEGUNDOS_PRA_CONFIRMAR = 1.0   // pedido dele: o mais rápido possível (mão na frente da câmera por 1 s já conta)
-let SEGUNDOS_SEM_USO_PRA_DORMIR = 1.0 // proteção mínima: digitando no escuro não dorme
+// Calibração (02/10/2026)
+let TAMPA_EIXO_MAIOR_MM: Float = 60   // trackpad: tampa mediu 66-77; mão no máximo 48
+let TAMPA_EIXO_MENOR_MM: Float = 38   // trackpad: tampa mediu 42-45; mão no máximo 30
 let INTERVALO = 0.25
 
 func log(_ s: String) {
@@ -38,8 +39,6 @@ func registro(_ classe: String, _ chave: String) -> Any? {
     return nil
 }
 
-// sensor desligado (repouso) devolve UInt64 máximo = -1: tratar como "sem leitura"
-func lux() -> Int? { (registro("AppleSPUVD6286", "CurrentLux") as? NSNumber).map { $0.intValue }.flatMap { $0 >= 0 ? $0 : nil } }
 func semUso() -> Double { ((registro("IOHIDSystem", "HIDIdleTime") as? NSNumber)?.doubleValue ?? 0) / 1e9 }
 
 func naTomada() -> Bool {
@@ -71,67 +70,109 @@ func dormir() {
 // Modo teste: `tampa-virtual teste` apaga a tela interna por 5 s e religa.
 if CommandLine.arguments.dropFirst().first == "teste" {
     guard let id = interna() else { print("tela interna não encontrada"); exit(1) }
-    print("lux=\(lux() ?? -1) semUso=\(Int(semUso()))s tomada=\(naTomada()) externa=\(temExterna()) interna=\(id)")
+    print("semUso=\(Int(semUso()))s tomada=\(naTomada()) externa=\(temExterna()) interna=\(id)")
     print("apagar:", ligarInterna(id, false)); sleep(5)
     print("religar:", ligarInterna(id, true)); exit(0)
 }
 
+// ---- trackpad (MultitouchSupport, privado) ----
+typealias MTDeviceRef = UnsafeMutableRawPointer
+typealias MTCallback = @convention(c) (MTDeviceRef?, UnsafeMutableRawPointer?, Int32, Double, Int32) -> Int32
+let mt = dlopen("/System/Library/PrivateFrameworks/MultitouchSupport.framework/MultitouchSupport", RTLD_NOW)
+func mtFn<T>(_ nome: String, _ t: T.Type) -> T? { mt.flatMap { dlsym($0, nome) }.map { unsafeBitCast($0, to: t) } }
+let MTCreateDefault = mtFn("MTDeviceCreateDefault", (@convention(c) () -> MTDeviceRef?).self)
+let MTRegister = mtFn("MTRegisterContactFrameCallback", (@convention(c) (MTDeviceRef?, MTCallback) -> Void).self)
+let MTStart = mtFn("MTDeviceStart", (@convention(c) (MTDeviceRef?, Int32) -> Int32).self)
+let MTStop = mtFn("MTDeviceStop", (@convention(c) (MTDeviceRef?) -> Int32).self)
+
+let trava = NSLock()
+var tampaNoTrackpad = false  // escrito pela thread do trackpad
+var trackpadMudou = false
+
+// struct Finger tem 96 bytes: estado +20, eixo maior +60, eixo menor +64 (mm)
+let aoTocar: MTCallback = { _, dados, n, _, _ in
+    var gigante = false
+    if let p = dados {
+        for i in 0..<Int(n) {
+            let b = p + i * 96
+            let estado = b.load(fromByteOffset: 20, as: Int32.self)
+            if (1...6).contains(estado),
+               b.load(fromByteOffset: 60, as: Float.self) >= TAMPA_EIXO_MAIOR_MM,
+               b.load(fromByteOffset: 64, as: Float.self) >= TAMPA_EIXO_MENOR_MM { gigante = true }
+        }
+    }
+    trava.lock(); if gigante != tampaNoTrackpad { tampaNoTrackpad = gigante; trackpadMudou = true }; trava.unlock()
+    return 0
+}
+
+var trackpad: MTDeviceRef? = nil
+var proximoTrackpad = Date.distantPast
+// logo depois de acordar o trackpad ainda não existe: tenta de novo a cada 2 s
+func ligarTrackpad() {
+    if let d = trackpad { _ = MTStop?(d); trackpad = nil }
+    proximoTrackpad = Date().addingTimeInterval(2)
+    guard let d = MTCreateDefault?() else { return }
+    trackpad = d
+    MTRegister?(d, aoTocar); _ = MTStart?(d, 0)
+}
+
+// ---- estado ----
 var idInterna = interna()
-var apagada = false            // tela interna desligada por nós
-var ultimoLux: Int? = nil
-var escuroDesde: Date? = nil   // só começa numa BORDA (luz caiu de >0 pra 0): quarto escuro parado não conta
-var tratada = false            // esta borda já virou ação
-var tentativas = 0             // repouso abortado por toque no trackpad: tenta de novo
+var apagada = false
+var fechadaAntes = false
+var tentativas = 0
 var tentouEm = Date.distantPast
 var ultimaVolta = Date()
 let MAX_TENTATIVAS = 3
-let SEGUNDOS_PRA_REPOUSO_ENTRAR = 8.0 // pmset sleepnow leva ~5 s até dormir de fato
-log("iniciado; interna=\(idInterna.map(String.init) ?? "?")")
+let SEGUNDOS_PRA_REPOUSO_ENTRAR = 8.0
 
 func religar(_ motivo: String) {
     if let id = idInterna { _ = ligarInterna(id, true) }
     apagada = false
     log(motivo)
 }
+func telaAcesa() -> Bool { CGDisplayIsAsleep(CGMainDisplayID()) == 0 }
 
-func podeDormir() -> Bool {
-    CGDisplayIsAsleep(CGMainDisplayID()) == 0 && semUso() >= SEGUNDOS_SEM_USO_PRA_DORMIR
-}
+ligarTrackpad()
+log("iniciado; interna=\(idInterna.map(String.init) ?? "?") trackpad=\(trackpad != nil)")
 
-while true {
+func passo() {
     let agora = Date()
-    // salto no relógio = o Mac dormiu de verdade; ao acordar não insiste (pode ser ele abrindo)
-    if agora.timeIntervalSince(ultimaVolta) > 3 { tentativas = 0 }
+    if agora.timeIntervalSince(ultimaVolta) > 1 { // o relógio pula 0,25 s; mais que 1 s = o Mac dormiu
+        // acordou de repouso: o trackpad pode ter parado; religa e esquece estado velho
+        tentativas = 0
+        trava.lock(); tampaNoTrackpad = false; trava.unlock()
+        ligarTrackpad()
+    }
     ultimaVolta = agora
-
+    if trackpad == nil && agora >= proximoTrackpad { ligarTrackpad(); if trackpad != nil { log("trackpad ligado") } }
     if let atual = interna() { idInterna = atual }
 
-    if let l = lux() {
-        if l <= LUX_FECHADA {
-            if let u = ultimoLux, u > LUX_FECHADA { escuroDesde = agora; tratada = false }
-        } else {
-            escuroDesde = nil; tratada = false; tentativas = 0
-            if apagada { religar("tampa aberta: tela interna ligada") }
-        }
-        ultimoLux = l
-    }
+    trava.lock(); let fechada = tampaNoTrackpad; trava.unlock()
 
-    let fechou = !tratada && (escuroDesde.map { agora.timeIntervalSince($0) >= SEGUNDOS_PRA_CONFIRMAR } ?? false)
-
-    if fechou {
+    if fechada && !fechadaAntes {
         if temExterna() && naTomada() {
-            if let id = idInterna, ligarInterna(id, false) { apagada = true; tratada = true; log("tampa fechada: tela interna apagada") }
-        } else if podeDormir() {
-            log("tampa fechada: repouso"); tratada = true; tentativas = 1; tentouEm = agora; dormir()
+            if let id = idInterna, ligarInterna(id, false) { apagada = true; log("tampa fechada: tela interna apagada") }
+        } else if telaAcesa() {
+            log("tampa fechada: repouso"); tentativas = 1; tentouEm = agora; dormir()
+        } else {
+            return // tela já apagada (Power Nap): tenta no próximo passo
         }
-    } else if tentativas > 0 && tentativas < MAX_TENTATIVAS && escuroDesde != nil
-                && agora.timeIntervalSince(tentouEm) >= SEGUNDOS_PRA_REPOUSO_ENTRAR && podeDormir() {
+    } else if fechada && tentativas > 0 && tentativas < MAX_TENTATIVAS
+                && agora.timeIntervalSince(tentouEm) >= SEGUNDOS_PRA_REPOUSO_ENTRAR && telaAcesa()
+                && semUso() >= 2 { // só insiste com a tampa AINDA no trackpad e ninguém mexendo
         tentativas += 1; tentouEm = agora
-        log("repouso abortado (toque no trackpad?): tentativa \(tentativas)"); dormir()
+        log("repouso abortado: tentativa \(tentativas)"); dormir()
+    } else if !fechada && fechadaAntes {
+        tentativas = 0
+        if apagada { religar("tampa aberta: tela interna ligada") } else { log("tampa aberta") }
     }
+    fechadaAntes = fechada
 
-    // nunca deixar o Mac sem tela
-    if apagada && !(temExterna() && naTomada()) { religar("sem monitor ou sem tomada: tela interna ligada"); tratada = false }
-
-    Thread.sleep(forTimeInterval: INTERVALO)
+    // nunca deixar o Mac sem tela; se tirou monitor/tomada com a tampa fechada, vai dormir
+    if apagada && !(temExterna() && naTomada()) { religar("sem monitor ou sem tomada: tela interna ligada"); fechadaAntes = false }
 }
+
+let relogio = Timer(timeInterval: INTERVALO, repeats: true) { _ in passo() }
+RunLoop.main.add(relogio, forMode: .default)
+RunLoop.main.run()
