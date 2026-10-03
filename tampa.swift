@@ -76,33 +76,47 @@ if CommandLine.arguments.dropFirst().first == "teste" {
 }
 
 var idInterna = interna()
-var fechada = false
+var apagada = false          // tela interna desligada por nós
 var escuroDesde: Date? = nil
+var ultimoRepouso = Date.distantPast
+let SEGUNDOS_ENTRE_TENTATIVAS = 15.0 // sem o sensor, o trackpad não desliga e um toque acorda o Mac
 log("iniciado; interna=\(idInterna.map(String.init) ?? "?")")
 
+func religar(_ motivo: String) {
+    if let id = idInterna { _ = ligarInterna(id, true) }
+    apagada = false
+    log(motivo)
+}
+
 while true {
-    let l = lux()
     if let atual = interna() { idInterna = atual }
 
-    if let l, l <= LUX_FECHADA {
-        if escuroDesde == nil { escuroDesde = Date() }
-    } else if l != nil {
-        escuroDesde = nil
-    }
-
-    let confirmouFechada = escuroDesde.map { Date().timeIntervalSince($0) >= SEGUNDOS_PRA_CONFIRMAR } ?? false
-
-    if confirmouFechada && !fechada {
-        if temExterna() && naTomada() {
-            if let id = idInterna, ligarInterna(id, false) { fechada = true; log("tampa fechada: tela interna apagada") }
-        } else if semUso() >= SEGUNDOS_SEM_USO_PRA_DORMIR {
-            log("tampa fechada: repouso"); fechada = true; dormir()
+    if let l = lux() {
+        if l <= LUX_FECHADA { escuroDesde = escuroDesde ?? Date() }
+        else {
+            escuroDesde = nil
+            if apagada { religar("tampa aberta: tela interna ligada") }
         }
-    } else if fechada && (escuroDesde == nil || !temExterna()) {
-        // abriu a tampa, ou tiraram o monitor: nunca deixar o Mac sem tela
-        if let id = idInterna { _ = ligarInterna(id, true) }
-        fechada = false; escuroDesde = nil
-        log("tampa aberta: tela interna ligada")
     }
+
+    let fechada = escuroDesde.map { Date().timeIntervalSince($0) >= SEGUNDOS_PRA_CONFIRMAR } ?? false
+
+    if fechada {
+        if temExterna() && naTomada() {
+            if !apagada, let id = idInterna, ligarInterna(id, false) { apagada = true; log("tampa fechada: tela interna apagada") }
+        } else {
+            if apagada { religar("tampa fechada sem monitor/tomada: tela interna ligada") }
+            if semUso() >= SEGUNDOS_SEM_USO_PRA_DORMIR && Date().timeIntervalSince(ultimoRepouso) >= SEGUNDOS_ENTRE_TENTATIVAS {
+                log("tampa fechada: repouso")
+                ultimoRepouso = Date()
+                dormir()
+                escuroDesde = nil // ao acordar, exige escuro de novo antes de voltar a dormir
+            }
+        }
+    }
+
+    // nunca deixar o Mac sem tela
+    if apagada && !temExterna() { religar("sem monitor externo: tela interna ligada") }
+
     Thread.sleep(forTimeInterval: INTERVALO)
 }
